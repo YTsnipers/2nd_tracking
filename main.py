@@ -26,23 +26,114 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+class SubscriberManager:
+    def __init__(self, subscribers_file: str = 'subscribers.json'):
+        self.subscribers_file = subscribers_file
+        self.subscribers = self.load_subscribers()
+    
+    def load_subscribers(self) -> List[Dict]:
+        """Load subscribers from JSON file"""
+        try:
+            with open(self.subscribers_file, 'r') as f:
+                data = json.load(f)
+                logger.info(f"Loaded {len(data.get('subscribers', []))} subscribers from {self.subscribers_file}")
+                return data.get('subscribers', [])
+        except (FileNotFoundError, json.JSONDecodeError) as e:
+            logger.warning(f"No existing subscribers file found, creating new one: {e}")
+            # Create default subscriber from environment variables
+            default_subscriber = {
+                "chat_id": os.getenv('TELEGRAM_CHAT_ID'),
+                "name": "Default User",
+                "active": True,
+                "created_at": datetime.now().isoformat(),
+                "notification_preferences": {
+                    "incoming": True,
+                    "outgoing": True,
+                    "min_amount": 0.0
+                }
+            }
+            self.subscribers = [default_subscriber] if default_subscriber["chat_id"] else []
+            self.save_subscribers()
+            return self.subscribers
+    
+    def save_subscribers(self):
+        """Save subscribers to JSON file"""
+        data = {
+            "last_updated": datetime.now().isoformat(),
+            "total_subscribers": len(self.subscribers),
+            "subscribers": self.subscribers
+        }
+        try:
+            with open(self.subscribers_file, 'w') as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+            logger.debug(f"Saved {len(self.subscribers)} subscribers to {self.subscribers_file}")
+        except Exception as e:
+            logger.error(f"Failed to save subscribers: {e}")
+    
+    def add_subscriber(self, chat_id: str, name: str = "Unknown User") -> bool:
+        """Add a new subscriber"""
+        # Check if already exists
+        for subscriber in self.subscribers:
+            if subscriber["chat_id"] == chat_id:
+                logger.warning(f"Subscriber {chat_id} already exists")
+                return False
+        
+        new_subscriber = {
+            "chat_id": chat_id,
+            "name": name,
+            "active": True,
+            "created_at": datetime.now().isoformat(),
+            "notification_preferences": {
+                "incoming": True,
+                "outgoing": True,
+                "min_amount": 0.0
+            }
+        }
+        self.subscribers.append(new_subscriber)
+        self.save_subscribers()
+        logger.info(f"Added new subscriber: {name} ({chat_id})")
+        return True
+    
+    def get_active_subscribers(self) -> List[Dict]:
+        """Get all active subscribers"""
+        return [sub for sub in self.subscribers if sub.get("active", True)]
+    
+    def should_notify_subscriber(self, subscriber: Dict, transaction_data: Dict) -> bool:
+        """Check if subscriber should be notified based on preferences"""
+        prefs = subscriber.get("notification_preferences", {})
+        
+        # Check direction preference
+        is_incoming = transaction_data["is_incoming"]
+        if is_incoming and not prefs.get("incoming", True):
+            return False
+        if not is_incoming and not prefs.get("outgoing", True):
+            return False
+        
+        # Check minimum amount
+        min_amount = prefs.get("min_amount", 0.0)
+        if transaction_data["amount_eth"] < min_amount:
+            return False
+        
+        return True
+
 class EthereumMonitor:
     def __init__(self):
         # Environment variables configuration
         self.eth_api_url = os.getenv('ETH_API_URL')  # Infura/Alchemy API URL
         self.telegram_token = os.getenv('TELEGRAM_BOT_TOKEN')
-        self.telegram_chat_id = os.getenv('TELEGRAM_CHAT_ID')
         
         # Validate required environment variables
-        if not all([self.eth_api_url, self.telegram_token, self.telegram_chat_id]):
+        if not all([self.eth_api_url, self.telegram_token]):
             missing = []
             if not self.eth_api_url: missing.append('ETH_API_URL')
             if not self.telegram_token: missing.append('TELEGRAM_BOT_TOKEN')
-            if not self.telegram_chat_id: missing.append('TELEGRAM_CHAT_ID')
             
             logger.error(f"Missing required environment variables: {missing}")
             logger.error("Please ensure .env file contains all necessary configurations")
             raise ValueError(f"Missing required environment variables: {missing}")
+        
+        # Initialize subscriber manager
+        self.subscriber_manager = SubscriberManager()
         
         # Monitored addresses configuration
         self.monitored_addresses = {
@@ -75,6 +166,7 @@ class EthereumMonitor:
         
         logger.info("Ethereum monitoring system initialized successfully")
         logger.info(f"Monitored addresses: {list(self.monitored_addresses.keys())}")
+        logger.info(f"Active subscribers: {len(self.subscriber_manager.get_active_subscribers())}")
         logger.info(f"Current block: {self.w3.eth.block_number}")
 
     def get_last_processed_block(self) -> int:
@@ -98,9 +190,6 @@ class EthereumMonitor:
     def is_external_transaction(self, tx: Dict) -> bool:
         """
         Determine if this is an external transaction
-        External transaction characteristics:
-        1. tx['input'] is '0x' indicates simple transfer
-        2. or from address is EOA (Externally Owned Account)
         """
         try:
             # Check if from address is a contract
@@ -140,18 +229,37 @@ class EthereumMonitor:
         """
         return message.strip()
 
-    async def send_telegram_notification(self, message: str):
-        """Send Telegram notification"""
-        try:
-            await self.bot.send_message(
-                chat_id=self.telegram_chat_id,
-                text=message,
-                parse_mode='Markdown',
-                disable_web_page_preview=True
-            )
-            logger.info("Telegram notification sent successfully")
-        except Exception as e:
-            logger.error(f"Failed to send Telegram notification: {e}")
+    async def send_telegram_notification(self, message: str, chat_id: str = None):
+        """Send Telegram notification to specific chat or all subscribers"""
+        if chat_id:
+            # Send to specific chat
+            try:
+                await self.bot.send_message(
+                    chat_id=chat_id,
+                    text=message,
+                    parse_mode='Markdown',
+                    disable_web_page_preview=True
+                )
+                logger.debug(f"Notification sent to {chat_id}")
+            except Exception as e:
+                logger.error(f"Failed to send notification to {chat_id}: {e}")
+        else:
+            # Send to all active subscribers
+            subscribers = self.subscriber_manager.get_active_subscribers()
+            success_count = 0
+            for subscriber in subscribers:
+                try:
+                    await self.bot.send_message(
+                        chat_id=subscriber["chat_id"],
+                        text=message,
+                        parse_mode='Markdown',
+                        disable_web_page_preview=True
+                    )
+                    success_count += 1
+                except Exception as e:
+                    logger.error(f"Failed to send notification to {subscriber['chat_id']}: {e}")
+            
+            logger.info(f"Notification sent successfully to {success_count}/{len(subscribers)} subscribers")
 
     async def process_transaction(self, tx: Dict):
         """Process single transaction"""
@@ -174,17 +282,36 @@ class EthereumMonitor:
         for monitored_addr, label in self.monitored_addresses.items():
             monitored_addr_lower = monitored_addr.lower()
             
+            transaction_data = None
+            
             # Check if it's an outgoing transaction
             if from_addr == monitored_addr_lower:
                 logger.info(f"🚨 Detected {label} outgoing transaction: {tx_hash}")
-                message = self.format_transaction_message(tx, label, False)
-                await self.send_telegram_notification(message)
+                transaction_data = {
+                    "is_incoming": False,
+                    "amount_eth": float(self.w3.from_wei(tx['value'], 'ether')),
+                    "tx_hash": tx_hash,
+                    "address_label": label
+                }
             
             # Check if it's an incoming transaction
             elif to_addr == monitored_addr_lower:
                 logger.info(f"🚨 Detected {label} incoming transaction: {tx_hash}")
-                message = self.format_transaction_message(tx, label, True)
-                await self.send_telegram_notification(message)
+                transaction_data = {
+                    "is_incoming": True,
+                    "amount_eth": float(self.w3.from_wei(tx['value'], 'ether')),
+                    "tx_hash": tx_hash,
+                    "address_label": label
+                }
+            
+            # Send notifications to eligible subscribers
+            if transaction_data:
+                message = self.format_transaction_message(tx, label, transaction_data["is_incoming"])
+                subscribers = self.subscriber_manager.get_active_subscribers()
+                
+                for subscriber in subscribers:
+                    if self.subscriber_manager.should_notify_subscriber(subscriber, transaction_data):
+                        await self.send_telegram_notification(message, subscriber["chat_id"])
 
     async def scan_block(self, block_number: int):
         """Scan single block"""
@@ -244,12 +371,14 @@ class EthereumMonitor:
         
         # Test Telegram connection
         try:
+            subscribers = self.subscriber_manager.get_active_subscribers()
             test_message = f"""
 🧪 **Monitoring System Connection Test**
 
 ✅ Ethereum Connection Success
 ✅ Telegram Connection Success
 📊 Current Block: {current_block}
+👥 Active Subscribers: {len(subscribers)}
 ⏰ Test Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 
 Monitored Addresses:
@@ -273,6 +402,7 @@ Monitored Addresses:
                 return
             
             # Send startup notification
+            subscribers = self.subscriber_manager.get_active_subscribers()
             start_message = f"""
 🚀 **Ethereum Address Monitoring System Started**
 
@@ -283,6 +413,7 @@ Monitored Addresses:
 ⚙️ Configuration:
 - Polling Interval: {self.poll_interval}s
 - Starting Block: {self.last_processed_block}
+- Active Subscribers: {len(subscribers)}
 
 ✅ System started, monitoring in real-time...
 ⏰ Start Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
