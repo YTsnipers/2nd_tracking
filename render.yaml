@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: ethereum-monitor
+    env: python
+    plan: starter
+    buildCommand: pip install -r requirements.txt
+    startCommand: python main.py
+    envVars:
+      - key: ETH_API_URL
+        sync: false
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: POLL_INTERVAL
+        value: "70"
